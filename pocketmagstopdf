@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Optional bootstrap: create venv if missing ---
+if [ ! -d ".venv" ]; then
+    echo "Creating virtual environment..."
+    python3.11 -m venv .venv
+fi
+
+# --- Activate the venv ---
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+# --- Run the script ---
+python3.11 pocketmagstopdf.py --quality=high --delay=1.8 --resume "$@"
+

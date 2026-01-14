@@ -40,8 +40,10 @@ Options:
                                 Downloads to the end of the magazine if absent.
                                 [default: 999]
 
-    --delay=DELAY               Set the time in seconds to wait between downloading each page of the magazine. (Optional)
+    --delay=DELAY               Set a base delay in seconds between page downloads. (Optional)
                                 There is no delay if absent. The value of the delay may be integer or decimal.
+                                When specified, the actual delay used is randomized between 100% and 200% of the
+                                provided value (e.g., --delay=2 yields delays between 2–4 seconds).
                                 Used both whenenever probing for the last valid page number of the magazine and
                                 between downloading each individual page for all quality settings except 'original'.
                                 [default: 0]
@@ -49,6 +51,11 @@ Options:
     --save-images               Save the downloaded JPEG images of the magazine pages to a subdirectory with the same
                                 name as the magazine in addition to generating the PDF of the magazine.
                                 Not used with '--quality=original'.
+                                [default: False]
+
+    --resume                    Resume a previous download by skipping pages whose images already exist in the save
+                                directory. Implies '--save-images'. After fetching or skipping all pages, generates
+                                the PDF from all image files in the save directory. Not used with '--quality=original'.
                                 [default: False]
 
     --image-subdir-prefix=PFX   If --save-images=yes then prefix name of the subdirectory the images are saved to with
@@ -237,6 +244,7 @@ def main():
     range_to = int(opts['--range-to'])
     delay = float(opts['--delay'])
     save_images = bool(opts['--save-images'])
+    resume = bool(opts['--resume'])
     image_subdir_prefix = str(opts['--image-subdir-prefix'])
     image_subdir_suffix = str(opts['--image-subdir-suffix'])
     user_uuid = str(opts['--uuid'])
@@ -308,6 +316,12 @@ def main():
     if save_images == True and quality == 'original':
         raise RuntimeError("Cannot save images when quality is set to 'original'.")
 
+    # --resume implies --save-images and is not compatible with 'original'
+    if resume:
+        save_images = True
+        if quality == 'original':
+            raise RuntimeError("Cannot use --resume when quality is set to 'original'.")
+
     # Check that a UUID option is provided with '--quality=original'
     if quality == 'original':
         if user_uuid == 'None' and user_uuid_randomise is False:
@@ -328,6 +342,7 @@ def main():
     LOGGER.info(range_text)
     LOGGER.info('Delay between downloading each page is {} seconds'.format(delay))
     LOGGER.info('Saving images is {}'.format(str(save_images).lower()))
+    LOGGER.info('Resume is {}'.format(str(resume).lower()))
     LOGGER.info('User UUID is {}'.format(user_uuid))
     LOGGER.info('Randomise User UUID is {}'.format(str(user_uuid_randomise).lower()))
     LOGGER.info('Hide User UUID is {}'.format(str(user_uuid_hide).lower()))
@@ -337,85 +352,149 @@ def main():
     LOGGER.info('Debug output is {}'.format(str(debug).lower()))
 
     if quality != 'original':
-        c = canvas.Canvas(pdf_fn)
-        c.setTitle(title)
-        with saving(c):
+        # Helper for randomized delay between 100% and 200% of specified amount
+        def randomized_delay():
+            return random.uniform(delay, 2 * delay) if delay > 0 else 0
 
-            # create directory to hold magazine images, if required
-            if save_images:
-                (pdf_parent_dir_name, pdf_filename) = os.path.split(os.path.abspath(pdf_fn))
-                (image_subdir_name, extension) = os.path.splitext(pdf_filename)
-                image_subdir_name = image_subdir_prefix + image_subdir_name + image_subdir_suffix
-                image_subdir_path = os.path.join(pdf_parent_dir_name, image_subdir_name)
-                os.makedirs(image_subdir_path)
+        # Prepare image save directory if needed (also for resume)
+        image_subdir_path = None
+        if save_images:
+            (pdf_parent_dir_name, pdf_filename) = os.path.split(os.path.abspath(pdf_fn))
+            (image_subdir_name, extension) = os.path.splitext(pdf_filename)
+            image_subdir_name = image_subdir_prefix + image_subdir_name + image_subdir_suffix
+            image_subdir_path = os.path.join(pdf_parent_dir_name, image_subdir_name)
+            os.makedirs(image_subdir_path, exist_ok=True)
 
+        def fetch_page_image(page_num):
+            page_url = list(url)
+            file_extension = 'jpg'
+            if quality == 'high' or quality == 'extrahigh':
+                file_extension = 'bin'
+            page_url[2] = '{}/{}/{:04d}.{}'.format(prefix, quality, page_num, file_extension)
+            page_url_comp = urlunparse(page_url)
+
+            try:
+                with urlopen(page_url_comp) as f:
+                    LOGGER.info('Downloading page {} from {}...'.format(page_num + 1, page_url_comp))
+
+                    # if: the extralow, low & mid quality "jpg" format URLs
+                    if quality == 'extralow' or quality == 'low' or quality == 'mid':
+                        im_local = Image.open(f)
+                    # else: the high quality "bin" format URL
+                    elif quality == 'high':
+                        # Rewrite the beginning of the file to include the proper JPEG file type code.
+                        jpg_header = binascii.unhexlify('FFD8')
+                        filedata = f.read()[2:]
+                        imgdata = BytesIO(jpg_header + filedata)
+                        try:
+                            im_local = Image.open(imgdata)
+                        except PIL.UnidentifiedImageError as uie:
+                            LOGGER.error('Page {} is not a valid image file. Unable to continue; exiting...'.format(page_num))
+                            return None
+                    # else: the extrahigh quality "bin" format URL
+                    elif quality == 'extrahigh':
+                        # Rewrite the beginning of the file to include the proper RIFF/webp file type code.
+                        riff_header = binascii.unhexlify('5249')
+                        filedata = f.read()[2:]
+                        imgdata = BytesIO(riff_header + filedata)
+                        try:
+                            im_local = Image.open(imgdata)
+                        except PIL.UnidentifiedImageError as uie:
+                            LOGGER.error('Page {} is not a valid image file. Unable to continue; exiting...'.format(page_num))
+                            return None
+                    return im_local
+            except HTTPError as e:
+                if e.code == 404 and quality == 'extrahigh':
+                    LOGGER.info('No image found. Some magazines are not available in \"extrahigh\" quality; try \"high\" quality instead. => stopping')
+                    return 'STOP'
+                elif e.code == 404:
+                    LOGGER.info('No image found => stopping')
+                    return 'STOP'
+                raise e
+
+        # Non-resume: build PDF while fetching; Resume: fetch missing images then build PDF from saved images
+        if not resume:
+            c = canvas.Canvas(pdf_fn)
+            c.setTitle(title)
+            with saving(c):
+                for page_num in range(range_from - 1, range_to):
+                    im = fetch_page_image(page_num)
+                    if im is None:
+                        break
+                    if im == 'STOP':
+                        break
+                    w, h = tuple(dim / dpi for dim in im.size)
+                    LOGGER.info('Image is {} x {} pixels and {:.2f}in x {:.2f}in at {} DPI'.format(im.width, im.height, w, h, dpi))
+                    c.setPageSize((w * inch, h * inch))
+                    c.drawInlineImage(im, 0, 0, w * inch, h * inch)
+                    c.showPage()
+                    if save_images and image_subdir_path is not None:
+                        # Save in human-ranged format - page count from 1
+                        if quality == 'extrahigh':
+                            image_name = '{:04d}.webp'.format(page_num + 1)
+                            image_path = os.path.join(image_subdir_path, image_name)
+                            im.save(image_path, lossless=True)
+                        else:
+                            image_name = '{:04d}.jpg'.format(page_num + 1)
+                            image_path = os.path.join(image_subdir_path, image_name)
+                            im.save(image_path)
+                    rd = randomized_delay()
+                    if rd > 0:
+                        sleep(rd)
+        else:
+            # Resume mode: skip pages that already exist; fetch any missing ones
+            if image_subdir_path is None:
+                LOGGER.error('Internal error: resume requires a valid image save directory')
+                exit(1)
             for page_num in range(range_from - 1, range_to):
-                page_url = list(url)
-                file_extension = 'jpg'
-                if quality == 'high' or quality == 'extrahigh':
-                    file_extension = 'bin'
-                page_url[2] = '{}/{}/{:04d}.{}'.format(prefix, quality, page_num, file_extension)
-                page_url = urlunparse(page_url)
+                # Determine expected filename for this page
+                if quality == 'extrahigh':
+                    expected_name = '{:04d}.webp'.format(page_num + 1)
+                else:
+                    expected_name = '{:04d}.jpg'.format(page_num + 1)
+                expected_path = os.path.join(image_subdir_path, expected_name)
+                if os.path.exists(expected_path):
+                    LOGGER.info('Page {} already exists at {} — skipping'.format(page_num + 1, expected_path))
+                    continue
+                im = fetch_page_image(page_num)
+                if im is None:
+                    break
+                if im == 'STOP':
+                    break
+                # Save newly fetched image
+                if quality == 'extrahigh':
+                    im.save(expected_path, lossless=True)
+                else:
+                    im.save(expected_path)
+                rd = randomized_delay()
+                if rd > 0:
+                    sleep(rd)
 
-                try:
-                    with urlopen(page_url) as f:
-                        LOGGER.info('Downloading page {} from {}...'.format(page_num + 1, page_url))
+            # After fetching/skipping, generate PDF from all image files in the save directory
+            LOGGER.info('Generating PDF from images in {}'.format(image_subdir_path))
+            image_files = sorted([
+                fn for fn in os.listdir(image_subdir_path)
+                if fn.lower().endswith('.jpg') or fn.lower().endswith('.webp')
+            ])
+            if len(image_files) == 0:
+                LOGGER.error('No images found in {}. Nothing to build into a PDF.'.format(image_subdir_path))
+                exit(1)
 
-                        # if: the extralow, low & mid quality "jpg" format URLs
-                        if quality == 'extralow' or quality == 'low' or quality == 'mid':
-                            im = Image.open(f)
-                        # else: the high quality "bin" format URL
-                        elif quality == 'high':
-                            # Rewrite the beginning of the file to include the proper JPEG file type code.
-                            jpg_header = binascii.unhexlify('FFD8')
-                            filedata = f.read()[2:]
-                            imgdata = BytesIO(jpg_header + filedata)
-                            try:
-                                im = Image.open(imgdata)
-                            except PIL.UnidentifiedImageError as uie:
-                                LOGGER.error('Page {} is not a valid image file. Unable to continue; exiting...'.format(
-                                    page_num))
-                                break
-                        # else: the extrahigh quality "bin" format URL
-                        elif quality == 'extrahigh':
-                            # Rewrite the beginning of the file to include the proper RIFF/webp file type code.
-                            riff_header = binascii.unhexlify('5249')
-                            filedata = f.read()[2:]
-                            imgdata = BytesIO(riff_header + filedata)
-                            try:
-                                im = Image.open(imgdata)
-                            except PIL.UnidentifiedImageError as uie:
-                                LOGGER.error('Page {} is not a valid image file. Unable to continue; exiting...'.format(
-                                    page_num))
-                                break
-
-                except HTTPError as e:
-                    if e.code == 404 and quality == 'extrahigh':
-                        LOGGER.info('No image found. Some magazines are not available in \'extrahigh\' quality; try \'high\' quality instead. => stopping')
-                        break
-                    elif e.code == 404:
-                        LOGGER.info('No image found => stopping')
-                        break
-                    raise e
-
-                w, h = tuple(dim / dpi for dim in im.size)
-
-                LOGGER.info('Image is {} x {} pixels and {:.2f}in x {:.2f}in at {} DPI'.format(im.width, im.height,
-                                                                                             w, h, dpi))
-                c.setPageSize((w * inch, h * inch))
-                c.drawInlineImage(im, 0, 0, w * inch, h * inch)
-                c.showPage()
-                if save_images:
-                    # Save in "human-ranged" format - starting the page count from 1, not 0.
-                    if quality == 'extrahigh':
-                        image_name = '{:04d}.webp'.format(page_num + 1)
-                        image_path = os.path.join(image_subdir_path, image_name)
-                        im.save(image_path, lossless=True)
-                    else:
-                        image_name = '{:04d}.jpg'.format(page_num + 1)
-                        image_path = os.path.join(image_subdir_path, image_name)
-                        im.save(image_path)
-                sleep(delay)
+            c = canvas.Canvas(pdf_fn)
+            c.setTitle(title)
+            with saving(c):
+                for fn in image_files:
+                    ipath = os.path.join(image_subdir_path, fn)
+                    try:
+                        im = Image.open(ipath)
+                    except PIL.UnidentifiedImageError as uie:
+                        LOGGER.warning('Skipping non-image file {} while building PDF'.format(ipath))
+                        continue
+                    w, h = tuple(dim / dpi for dim in im.size)
+                    LOGGER.debug('Adding {} ({} x {} px) to PDF at {} DPI'.format(fn, im.width, im.height, dpi))
+                    c.setPageSize((w * inch, h * inch))
+                    c.drawInlineImage(im, 0, 0, w * inch, h * inch)
+                    c.showPage()
 
     # else quality == 'original'
     else:
@@ -447,8 +526,14 @@ def main():
         bad_page_count = 0
         bad_page_limit = page_jump
         jpeg_quality = 'extralow'
+        # Helper for randomized delay between 100% and 200% of specified amount
+        def randomized_delay():
+            return random.uniform(delay, 2 * delay) if delay > 0 else 0
+
         while True:
-            sleep(delay)
+            rd = randomized_delay()
+            if rd > 0:
+                sleep(rd)
             jpeg_url = list(url)
             jpeg_url[2] = '{}/{}/{:04d}.{}'.format(prefix, jpeg_quality, page_num, file_extension)
             jpeg_url = urlunparse(jpeg_url)

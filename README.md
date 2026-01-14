@@ -13,6 +13,8 @@ With thanks to:
 **NB:** I have only been able to test this on the small number of magazines I have purchased on [pocketmags.com](https://pocketmags.com)
 
 ## Feature Additions:
+### 14/01/2026
+- Add `--resume` option: resumes a previous run by skipping pages whose images already exist in the save directory, fetching only missing ones, and then generating the PDF from all images in that directory. It implies `--save-images` and is only available for non-`original` qualities.
 ### 14/07/2022
 - Add the option to enable downloading of magazines in the elusive "high" quality format (only when `--quality=high` is used, otherwise the default is "mid").
 - Added the option to insert a custom title into the generated PDF's metadata to replace the default of "untitled.pdf".
@@ -68,6 +70,8 @@ pocketmagstopdf.py [options] <pdf> <url>
 
 --delay=DELAY               Set the time in seconds to wait between downloading each page of the magazine. (Optional)
                             There is no delay if absent. The value of the delay may be integer or decimal.
+                            When specified, the actual delay used is randomized between 100% and 200% of the
+                            provided value (e.g., --delay=2 results in per-iteration delays between 2–4 seconds).
                             Used both whenenever probing for the last valid page number of the magazine and
                             between downloading each individual page for all quality settings except 'original'.
                             [default: 0]
@@ -75,6 +79,11 @@ pocketmagstopdf.py [options] <pdf> <url>
 --save-images               Save the downloaded JPEG images of the magazine pages to a subdirectory with the same
                             name as the magazine in addition to generating the PDF of the magazine.
                             Not used with '--quality=original'.
+                            [default: False]
+
+--resume                    Resume a previous download by skipping pages whose images already exist in the save
+                            directory. Implies '--save-images'. After fetching or skipping all pages, generates
+                            the PDF from all image files in the save directory. Not used with '--quality=original'.
                             [default: False]
 
 --image-subdir-prefix=PFX   If --save-images=yes then prefix name of the subdirectory the images are saved to with
@@ -127,6 +136,31 @@ pocketmagstopdf.py [options] <pdf> <url>
 pocketmagstopdf.py --quality=extrahigh --delay=2 --title="My Magazine, Issue 73, October 2022" my_magazine.pdf https://mcdatastore.blob.core.windows.net/mcmags/<STORAGE_BUCKET_UUID>/<ISSUE_UUID>/extralow/0000.jpg
 
 pocketmagstopdf.py --quality=original --delay=0.5 --uuid-hide --uuid=<USER_UUID> my_magazine.pdf https://mcdatastore.blob.core.windows.net/mcmags/<STORAGE_BUCKET_UUID>/<ISSUE_UUID>/extralow/0000.jpg
+
+# Resume example: skip existing images, fetch missing, then build PDF
+pocketmagstopdf.py --resume --quality=mid --dpi=150 \
+  --range-from=1 --range-to=999 \
+  my_magazine.pdf https://mcdatastore.blob.core.windows.net/mcmags/<STORAGE_BUCKET_UUID>/<ISSUE_UUID>/mid/0000.jpg
+```
+
+## Resume Mode
+- **Behavior:** Skips downloading pages whose images already exist in the save directory; downloads missing pages; then builds the PDF from all images found in the save directory.
+- **Implications:** Implies `--save-images`. Not supported with `--quality=original`.
+- **Image formats:** Uses `.jpg` for `extralow`, `low`, `mid`, `high`; uses `.webp` for `extrahigh`.
+- **Directory naming:** Images are saved under a subdirectory derived from the output PDF filename. You can control the directory name via `--image-subdir-prefix` and `--image-subdir-suffix`.
+
+## Python 3.11 Setup
+On macOS, you can use Homebrew or the included script:
+
+```bash
+# Using the provided setup script
+./setup.sh
+
+# Or manual steps
+brew install python@3.11
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ## Notes:
